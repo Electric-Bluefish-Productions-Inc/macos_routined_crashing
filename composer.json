@@ -1,0 +1,9 @@
+{
+  "name": "james/disable-routined",
+  "description": "macOS zsh CLI to disable, restore, install, and uninstall the routined launch agent.",
+  "type": "project",
+  "bin": [
+    "bin/disable-routined"
+  ],
+  "require": {}
+}

@@ -1,0 +1,353 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+APP_NAME="disable-routined"
+VERSION="1.0.0"
+LABEL="com.apple.routined"
+PLIST="/System/Library/LaunchAgents/com.apple.routined.plist"
+GUI_TARGET="gui/$(id -u)"
+APP_HOME="${DISABLE_ROUTINED_HOME:-$HOME/.disable-routined}"
+LOG_DIR="$APP_HOME/logs"
+LOG_FILE="$LOG_DIR/${APP_NAME}.log"
+INSTALL_DIR="${DISABLE_ROUTINED_INSTALL_DIR:-$HOME/.local/bin}"
+INSTALL_PATH="$INSTALL_DIR/$APP_NAME"
+SCRIPT_PATH="${0:A}"
+DRY_RUN=0
+CRASH_SCAN_WINDOW="12h"
+
+ensure_runtime_dirs() {
+  mkdir -p "$LOG_DIR"
+}
+
+timestamp() {
+  date "+%Y-%m-%d %H:%M:%S"
+}
+
+print_and_log() {
+  local line
+  ensure_runtime_dirs
+
+  for line in "$@"; do
+    print -r -- "$line"
+    print -r -- "$line" >> "$LOG_FILE"
+  done
+}
+
+log_line() {
+  local level="$1"
+  shift
+  local message="$*"
+
+  ensure_runtime_dirs
+  local line="[$(timestamp)] [$level] $message"
+  print -r -- "$line" >> "$LOG_FILE"
+  print -r -- "$line"
+}
+
+run_allow_failure() {
+  local description="$1"
+  shift
+
+  ensure_runtime_dirs
+
+  if (( DRY_RUN )); then
+    log_line "INFO" "[dry-run] $description"
+    return 0
+  fi
+
+  if "$@" >> "$LOG_FILE" 2>&1; then
+    log_line "INFO" "$description"
+  else
+    log_line "WARN" "$description failed or was unnecessary"
+  fi
+
+  return 0
+}
+
+show_help() {
+  cat <<EOF
+$APP_NAME v$VERSION
+
+Usage:
+  $APP_NAME [command] [options]
+
+Commands:
+  disable           Disable and stop the per-user routined agent (default)
+  enable            Re-enable the per-user routined agent
+  status            Show disabled state and running processes
+  install           Scan the last $CRASH_SCAN_WINDOW of system logs, then install the CLI into $INSTALL_DIR
+  uninstall         Remove the installed CLI
+  log-path          Print the log file path
+  tail-log          Print the last 40 log lines
+  help              Show this help text
+  version           Show the version
+
+Options:
+  --dry-run         Print actions without changing the system
+  -h, --help        Show help
+  -v, --version     Show version
+
+Uninstall options:
+  --keep-logs         Preserve $APP_HOME
+  --restore-routined  Re-enable routined before uninstalling
+
+Environment overrides:
+  DISABLE_ROUTINED_HOME         Override the app state directory
+  DISABLE_ROUTINED_INSTALL_DIR  Override the install directory
+EOF
+}
+
+show_version() {
+  print -r -- "$APP_NAME v$VERSION"
+}
+
+show_log_path() {
+  ensure_runtime_dirs
+  print -r -- "$LOG_FILE"
+}
+
+tail_log() {
+  ensure_runtime_dirs
+
+  if [[ ! -f "$LOG_FILE" ]]; then
+    print -r -- "No log file yet: $LOG_FILE"
+    return 0
+  fi
+
+  tail -n 40 "$LOG_FILE"
+}
+
+show_status() {
+  local disabled_output processes_output
+
+  ensure_runtime_dirs
+  log_line "INFO" "Checking routined status"
+
+  disabled_output="$(launchctl print-disabled "$GUI_TARGET" 2>/dev/null | grep -F "$LABEL" || true)"
+  processes_output="$(pgrep -lf routined || true)"
+
+  print_and_log "" "Disabled launch services:"
+  if [[ -n "$disabled_output" ]]; then
+    print_and_log "$disabled_output"
+  else
+    print_and_log "No disabled entry for $LABEL"
+  fi
+
+  print_and_log "" "Running processes:"
+  if [[ -n "$processes_output" ]]; then
+    print_and_log "$processes_output"
+  else
+    print_and_log "Not running"
+  fi
+}
+
+disable_routined() {
+  log_line "INFO" "Disabling routined"
+  run_allow_failure "Stopping the launch agent" launchctl bootout "$GUI_TARGET" "$PLIST"
+  run_allow_failure "Disabling the launch agent" launchctl disable "$GUI_TARGET/$LABEL"
+  run_allow_failure "Killing active routined processes" pkill -9 routined
+  show_status
+  log_line "INFO" "Disable command finished"
+}
+
+enable_routined() {
+  log_line "INFO" "Re-enabling routined"
+  run_allow_failure "Re-enabling the launch agent" launchctl enable "$GUI_TARGET/$LABEL"
+  run_allow_failure "Bootstrapping the launch agent" launchctl bootstrap "$GUI_TARGET" "$PLIST"
+  run_allow_failure "Kickstarting the launch agent" launchctl kickstart -k "$GUI_TARGET/$LABEL"
+  show_status
+  log_line "INFO" "Enable command finished"
+}
+
+scan_recent_routined_crashes() {
+  local predicate scan_output crash_count plural_suffix
+
+  ensure_runtime_dirs
+  log_line "INFO" "Scanning system logs for routined crashes in the last $CRASH_SCAN_WINDOW"
+
+  if ! command -v log >/dev/null 2>&1; then
+    log_line "WARN" "The macOS 'log' command is unavailable; skipping the pre-install crash scan"
+    return 0
+  fi
+
+  predicate='(process == "routined" OR sender == "routined" OR eventMessage CONTAINS[c] "routined") AND (eventMessage CONTAINS[c] "crash" OR eventMessage CONTAINS[c] "corpse" OR eventMessage CONTAINS[c] "exception" OR eventMessage CONTAINS[c] "fatal")'
+  scan_output="$(log show --style compact --last "$CRASH_SCAN_WINDOW" --predicate "$predicate" 2>>"$LOG_FILE" || true)"
+  crash_count=$(print -r -- "$scan_output" | grep -cve '^[[:space:]]*$' || true)
+
+  if (( crash_count > 0 )); then
+    plural_suffix="y"
+    if (( crash_count != 1 )); then
+      plural_suffix="ies"
+    fi
+
+    print -r -- "$scan_output" >> "$LOG_FILE"
+    print_and_log "" "Found $crash_count routined crash-related log entr$plural_suffix in the last $CRASH_SCAN_WINDOW."
+    print_and_log "Proceeding with installation. Full scan output was appended to: $LOG_FILE"
+  else
+    print_and_log "" "No routined crash-related log entries were found in the last $CRASH_SCAN_WINDOW."
+    print_and_log "Installation may not be necessary unless you are troubleshooting another routined issue."
+  fi
+}
+
+install_cli() {
+  ensure_runtime_dirs
+  scan_recent_routined_crashes
+
+  if (( DRY_RUN )); then
+    log_line "INFO" "[dry-run] Would install $APP_NAME to $INSTALL_PATH"
+    return 0
+  fi
+
+  mkdir -p "$INSTALL_DIR"
+  cp "$SCRIPT_PATH" "$INSTALL_PATH"
+  chmod +x "$INSTALL_PATH"
+
+  log_line "INFO" "Installed $APP_NAME to $INSTALL_PATH"
+  print -r -- "Installed command: $INSTALL_PATH"
+
+  if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+    print -r -- "Add this directory to your PATH if needed: $INSTALL_DIR"
+  fi
+}
+
+uninstall_cli() {
+  local keep_logs=0
+  local restore_routined=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --keep-logs)
+        keep_logs=1
+        ;;
+      --restore-routined)
+        restore_routined=1
+        ;;
+      *)
+        print -u2 -r -- "Unknown uninstall option: $1"
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  if (( restore_routined )); then
+    enable_routined
+  fi
+
+  ensure_runtime_dirs
+
+  if (( DRY_RUN )); then
+    log_line "INFO" "[dry-run] Would remove $INSTALL_PATH"
+    if (( keep_logs )); then
+      log_line "INFO" "[dry-run] Would preserve $APP_HOME"
+    else
+      log_line "INFO" "[dry-run] Would remove $APP_HOME"
+    fi
+    return 0
+  fi
+
+  if [[ -e "$INSTALL_PATH" ]]; then
+    rm -f "$INSTALL_PATH"
+    log_line "INFO" "Removed installed command at $INSTALL_PATH"
+  else
+    log_line "INFO" "No installed command found at $INSTALL_PATH"
+  fi
+
+  if (( keep_logs )); then
+    log_line "INFO" "Preserved app data at $APP_HOME"
+    print -r -- "Logs kept at: $LOG_FILE"
+  else
+    log_line "INFO" "Removing app data at $APP_HOME"
+    rm -rf "$APP_HOME"
+    print -r -- "Removed app data: $APP_HOME"
+  fi
+
+  print -r -- "Uninstall complete."
+}
+
+parse_arguments() {
+  local -a command_args
+  local command=""
+  local show_help_flag=0
+  local show_version_flag=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      -h|--help)
+        show_help_flag=1
+        ;;
+      -v|--version)
+        show_version_flag=1
+        ;;
+      --)
+        shift
+        command_args+=("$@")
+        break
+        ;;
+      *)
+        if [[ -z "$command" ]]; then
+          command="$1"
+        else
+          command_args+=("$1")
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  if (( show_version_flag )); then
+    show_version
+    exit 0
+  fi
+
+  if (( show_help_flag )); then
+    show_help
+    exit 0
+  fi
+
+  COMMAND="${command:-disable}"
+  REMAINING_ARGS=("${command_args[@]}")
+}
+
+parse_arguments "$@"
+set -- "${REMAINING_ARGS[@]}"
+
+
+case "$COMMAND" in
+  disable)
+    disable_routined "$@"
+    ;;
+  enable)
+    enable_routined "$@"
+    ;;
+  status)
+    show_status
+    ;;
+  install)
+    install_cli "$@"
+    ;;
+  uninstall)
+    uninstall_cli "$@"
+    ;;
+  log-path)
+    show_log_path
+    ;;
+  tail-log)
+    tail_log
+    ;;
+  help)
+    show_help
+    ;;
+  version)
+    show_version
+    ;;
+  *)
+    print -u2 -r -- "Unknown command: $COMMAND"
+    print -u2 -r -- "Run '$APP_NAME --help' for usage."
+    exit 1
+    ;;
+esac
